@@ -1,7 +1,4 @@
 #include "SuziePlugin.h"
-#include "SuzieGameplayTags.h"
-#include "SuzieSchemaOverride.h"
-#include "SuzieCustomSerializers.h"
 #include "Misc/FileHelper.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -23,7 +20,6 @@
 #include "UObject/UObjectAllocator.h"
 #include "UObject/UObjectHash.h"
 #include "UObject/SparseDelegate.h"
-#include "Serialization/AsyncLoadingEvents.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Engine/NetConnection.h"
 #if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3
@@ -31,6 +27,10 @@
 #endif
 
 DEFINE_LOG_CATEGORY(LogSuzie);
+
+FSuzieDelegates::FOnJmapProcessed FSuzieDelegates::OnJmapProcessed;
+FSimpleMulticastDelegate FSuzieDelegates::OnAllJmapsProcessed;
+FSuzieDelegates::FFindStructSerializer FSuzieDelegates::FindStructSerializer;
 
 #define LOCTEXT_NAMESPACE "FSuziePluginModule"
 
@@ -43,27 +43,13 @@ void FSuziePluginModule::StartupModule()
 
     ProcessAllJsonClassDefinitions();
 
-    // Register our freshly generated /Script/ classes with the IoStore loader's global import store.
-    // The loader registered all script objects early in startup (before this PostEngineInit module
-    // ran), so cooked game packages reference our classes by a script-import hash the loader cannot
-    // yet resolve - opening such an asset fails with "Could not find class object". Re-running the
-    // registration is idempotent and additive (it only adds the new /Script/UWE* objects), and makes
-    // those hashes resolve so cooked content whose class is Suzie-generated can load.
-    NotifyRegistrationComplete();
-
-    // Must run while native tag registration is still open: DoneAddingNativeTags is bound to the
-    // OnPostEngineInit broadcast, which fires after PostEngineInit plugin modules load
-    FSuzieGameplayTags::Get().RegisterCollectedTags();
-
-    // Activate game-accurate unversioned schemas for cooked content (no-op if nothing diverges)
-    FSuzieSchemaOverrides::Get().RegisterProvider();
+    // Still in startup, so listeners finish before the later PostEngineInit modules load
+    FSuzieDelegates::OnAllJmapsProcessed.Broadcast();
 }
 
 void FSuziePluginModule::ShutdownModule()
 {
     UE_LOG(LogSuzie, Display, TEXT("Suzie plugin shutting down"));
-
-    FSuzieSchemaOverrides::Get().UnregisterProvider();
 }
 
 void FSuziePluginModule::ProcessAllJsonClassDefinitions()
@@ -255,18 +241,12 @@ void FSuziePluginModule::CreateDynamicClassesForJsonObject(const TSharedPtr<FJso
         FinalizeClass(ClassGenerationContext, ClassPendingFinalization);
     }
 
-    // Harvest the game's per-class property order for unversioned schema overrides. This must
-    // happen after class generation so jmap property descriptors of native classes resolve their
-    // type references against already-created dynamic types.
-    FSuzieSchemaOverrides::Get().BuildFromJmap(*Objects,
+    // After class generation, so the jmap's property descriptors resolve against the types made above
+    FSuzieDelegates::OnJmapProcessed.Broadcast(*Objects,
         [this, &ClassGenerationContext](FFieldVariant Owner, const TSharedPtr<FJsonObject>& PropertyJson) -> FProperty*
         {
             return BuildProperty(ClassGenerationContext, Owner, PropertyJson);
         });
-
-    // Collect the game's gameplay tags from dumped GameplayTagsList instances (full dumps only);
-    // registration happens once after all files are processed
-    FSuzieGameplayTags::Get().CollectFromJmap(*Objects);
 }
 
 UPackage* FSuziePluginModule::FindOrCreatePackage(FDynamicClassGenerationContext& Context, const FString& PackageName)
@@ -493,11 +473,11 @@ class FDynamicStructCppStructOps : public UScriptStruct::ICppStructOps
     // Optional hand-written binary serializer for game structs serialized natively in the cooked
     // data (STRUCT_SerializeNative). When set, the capabilities report HasSerializer so
     // PrepareCppStructOps flags the struct STRUCT_SerializeNative and SerializeItem routes
-    // through this instead of the tagged/unversioned property path. See SuzieCustomSerializers.
-    SuzieCustomSerializers::FStructSerializeFn CustomSerializeFn;
+    // through this instead of the tagged/unversioned property path. See FSuzieDelegates::FindStructSerializer.
+    FSuzieDelegates::FStructSerializeFn CustomSerializeFn;
 
 public:
-    FDynamicStructCppStructOps(int32 InSize, int32 InAlignment, UScriptStruct::ICppStructOps* InParentOps, UScriptStruct* InStruct, SuzieCustomSerializers::FStructSerializeFn InSerializeFn = nullptr)
+    FDynamicStructCppStructOps(int32 InSize, int32 InAlignment, UScriptStruct::ICppStructOps* InParentOps, UScriptStruct* InStruct, FSuzieDelegates::FStructSerializeFn InSerializeFn = nullptr)
         : ICppStructOps(InSize, InAlignment)
         , ParentCppStructOps(InParentOps)
         , DynamicStruct(InStruct)
@@ -684,11 +664,11 @@ class FDynamicStructCppStructOps : public UScriptStruct::ICppStructOps
     // Optional hand-written binary serializer for game structs serialized natively in the cooked data
     // (STRUCT_SerializeNative). When set, GetCapabilities reports HasSerializer so PrepareCppStructOps
     // flags the struct STRUCT_SerializeNative and SerializeItem routes through this instead of the
-    // tagged/unversioned property path. See SuzieCustomSerializers.
-    SuzieCustomSerializers::FStructSerializeFn CustomSerializeFn;
+    // tagged/unversioned property path. See FSuzieDelegates::FindStructSerializer.
+    FSuzieDelegates::FStructSerializeFn CustomSerializeFn;
 
 public:
-    FDynamicStructCppStructOps(int32 InSize, int32 InAlignment, UScriptStruct::ICppStructOps* InParentOps, UScriptStruct* InStruct, SuzieCustomSerializers::FStructSerializeFn InSerializeFn = nullptr)
+    FDynamicStructCppStructOps(int32 InSize, int32 InAlignment, UScriptStruct::ICppStructOps* InParentOps, UScriptStruct* InStruct, FSuzieDelegates::FStructSerializeFn InSerializeFn = nullptr)
         : ICppStructOps(InSize, InAlignment)
         , ParentCppStructOps(InParentOps)
         , DynamicStruct(InStruct)
@@ -1099,7 +1079,7 @@ UScriptStruct* FSuziePluginModule::FindOrCreateScriptStruct(FDynamicClassGenerat
     // we need to create synthetic CppStructOps for this dynamic struct. Without this, the vtable pointer at offset 0
     // would never be initialized, causing crashes when the engine calls virtual methods like OnDataTableChanged().
     UScriptStruct::ICppStructOps* AncestorCppStructOps = FindNearestAncestorCppStructOps(NewStruct);
-    SuzieCustomSerializers::FStructSerializeFn CustomSerializeFn = SuzieCustomSerializers::FindStructSerializer(StructPath);
+    FSuzieDelegates::FStructSerializeFn CustomSerializeFn = FSuzieDelegates::FindStructSerializer.IsBound() ? FSuzieDelegates::FindStructSerializer.Execute(StructPath) : nullptr;
     if (AncestorCppStructOps || CustomSerializeFn)
     {
         // Ensure PropertiesSize is aligned so that GetStructureSize() == PropertiesSize
